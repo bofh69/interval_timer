@@ -38,6 +38,8 @@ public class MainActivity extends Activity {
     private static final int GREEN = 0xFF2E7D32;
     private static final int RED = 0xFFC62828;
     private static final int BLUE = 0xFF1565C0;
+    private static final int BEEP_DURATION_MS = 100;
+    private static final int FINAL_BEEP_DURATION_MS = 750;
     private final ArrayList<Workout> workouts = new ArrayList<>();
     private final Object timerLock = new Object();
     private final Object audioLock = new Object();
@@ -459,7 +461,8 @@ public class MainActivity extends Activity {
     private void playBeep(boolean endOfInterval, boolean keepAudioWarm) {
         synchronized (audioLock) {
             if (toneGenerator != null) {
-                toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, endOfInterval ? 500 : 100);
+                toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP,
+                        endOfInterval ? FINAL_BEEP_DURATION_MS : BEEP_DURATION_MS);
                 if (endOfInterval && !keepAudioWarm) {
                     int generation = audioGeneration;
                     audioStopTask = timerExecutor.schedule(() -> {

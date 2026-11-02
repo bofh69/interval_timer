@@ -2,13 +2,6 @@
 
 A native Android app for creating and running interval workouts.
 
-The countdown stays on one line and resizes when pause controls appear, then
-expands again on resume. Beeps use the media volume and audio route, including
-Bluetooth headsets. A silent stream starts two seconds before the first countdown
-beep and stays active through the final beep to reduce headset wake-up delays.
-Intervals started or resumed close to a beep have only the remaining time to warm
-up the headset; effectiveness depends on the headset.
-
 ## Build
 
 Install JDK 17 and the Android SDK, then run:
