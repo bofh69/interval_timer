@@ -45,6 +45,8 @@ public class MainActivity extends Activity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ScheduledExecutorService timerExecutor =
             Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService audioExecutor =
+            Executors.newSingleThreadScheduledExecutor();
     private ScheduledFuture<?> timerTask;
     private final Runnable timerTick = this::runTimerTick;
 
@@ -78,12 +80,17 @@ public class MainActivity extends Activity {
             timerExecutor.shutdownNow();
         }
         mainHandler.removeCallbacksAndMessages(null);
-        synchronized (audioLock) {
-            stopAudio();
-            if (silentAudio != null) {
-                silentAudio.release();
-                silentAudio = null;
-            }
+        if (!audioExecutor.isShutdown()) {
+            audioExecutor.execute(() -> {
+                synchronized (audioLock) {
+                    stopAudioNow();
+                    if (silentAudio != null) {
+                        silentAudio.release();
+                        silentAudio = null;
+                    }
+                }
+            });
+            audioExecutor.shutdown();
         }
         super.onDestroy();
     }
@@ -420,45 +427,23 @@ public class MainActivity extends Activity {
     }
 
     private void prepareAudio() {
-        synchronized (audioLock) {
-            audioGeneration++;
-            if (audioStopTask != null) {
-                audioStopTask.cancel(false);
-                audioStopTask = null;
+        audioExecutor.execute(() -> {
+            synchronized (audioLock) {
+                prepareAudioNow();
             }
-            if (silentAudio == null) {
-                int sampleRate = 8000;
-                short[] silence = new short[sampleRate];
-                silentAudio = new AudioTrack.Builder()
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setLegacyStreamType(AudioManager.STREAM_MUSIC)
-                                .build())
-                        .setAudioFormat(new AudioFormat.Builder()
-                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                .setSampleRate(sampleRate)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                                .build())
-                        .setTransferMode(AudioTrack.MODE_STATIC)
-                        .setBufferSizeInBytes(silence.length * 2)
-                        .build();
-                if (silentAudio.write(silence, 0, silence.length) != silence.length
-                        || silentAudio.setLoopPoints(0, silence.length, -1) != AudioTrack.SUCCESS) {
-                    throw new IllegalStateException("Could not initialize headset warm-up audio");
-                }
-            }
-            if (silentAudio.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
-                silentAudio.play();
-            }
-        }
+        });
     }
 
-    private void playBeep(boolean endOfInterval, boolean keepAudioWarm) {
-        synchronized (audioLock) {
-            releaseBeepAudio();
-            int durationMs = endOfInterval ? FINAL_BEEP_DURATION_MS : BEEP_DURATION_MS;
-            int sampleRate = 16000;
-            short[] samples = createBeepSamples(durationMs, sampleRate);
-            beepAudio = new AudioTrack.Builder()
+    private void prepareAudioNow() {
+        audioGeneration++;
+        if (audioStopTask != null) {
+            audioStopTask.cancel(false);
+            audioStopTask = null;
+        }
+        if (silentAudio == null) {
+            int sampleRate = 8000;
+            short[] silence = new short[sampleRate];
+            silentAudio = new AudioTrack.Builder()
                     .setAudioAttributes(new AudioAttributes.Builder()
                             .setLegacyStreamType(AudioManager.STREAM_MUSIC)
                             .build())
@@ -468,25 +453,59 @@ public class MainActivity extends Activity {
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .build())
                     .setTransferMode(AudioTrack.MODE_STATIC)
-                    .setBufferSizeInBytes(samples.length * 2)
+                    .setBufferSizeInBytes(silence.length * 2)
                     .build();
-            if (beepAudio.getState() != AudioTrack.STATE_INITIALIZED
-                    || beepAudio.write(samples, 0, samples.length) != samples.length) {
-                releaseBeepAudio();
-                throw new IllegalStateException("Could not initialize timer beep audio");
+            if (silentAudio.write(silence, 0, silence.length) != silence.length
+                    || silentAudio.setLoopPoints(0, silence.length, -1) != AudioTrack.SUCCESS) {
+                throw new IllegalStateException("Could not initialize headset warm-up audio");
             }
-            beepAudio.play();
-            if (endOfInterval && !keepAudioWarm) {
-                int generation = audioGeneration;
-                audioStopTask = timerExecutor.schedule(() -> {
-                    synchronized (audioLock) {
-                        if (generation == audioGeneration) {
-                            audioStopTask = null;
-                            stopAudio();
-                        }
+        }
+        if (silentAudio.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
+            silentAudio.play();
+        }
+    }
+
+    private void playBeep(boolean endOfInterval, boolean keepAudioWarm) {
+        audioExecutor.execute(() -> {
+            synchronized (audioLock) {
+                playBeepNow(endOfInterval, keepAudioWarm);
+            }
+        });
+    }
+
+    private void playBeepNow(boolean endOfInterval, boolean keepAudioWarm) {
+        releaseBeepAudio();
+        int durationMs = endOfInterval ? FINAL_BEEP_DURATION_MS : BEEP_DURATION_MS;
+        int sampleRate = 16000;
+        short[] samples = createBeepSamples(durationMs, sampleRate);
+        beepAudio = new AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setLegacyStreamType(AudioManager.STREAM_MUSIC)
+                        .build())
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build())
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(samples.length * 2)
+                .build();
+        if (beepAudio.getState() != AudioTrack.STATE_INITIALIZED
+                || beepAudio.write(samples, 0, samples.length) != samples.length) {
+            releaseBeepAudio();
+            throw new IllegalStateException("Could not initialize timer beep audio");
+        }
+        beepAudio.play();
+        if (endOfInterval && !keepAudioWarm) {
+            int generation = audioGeneration;
+            audioStopTask = audioExecutor.schedule(() -> {
+                synchronized (audioLock) {
+                    if (generation == audioGeneration) {
+                        audioStopTask = null;
+                        stopAudioNow();
                     }
-                }, durationMs + 100L, TimeUnit.MILLISECONDS);
-            }
+                }
+            }, durationMs + 100L, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -515,17 +534,25 @@ public class MainActivity extends Activity {
     }
 
     private void stopAudio() {
-        synchronized (audioLock) {
-            audioGeneration++;
-            if (audioStopTask != null) {
-                audioStopTask.cancel(false);
-                audioStopTask = null;
-            }
-            releaseBeepAudio();
-            if (silentAudio != null
-                    && silentAudio.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
-                silentAudio.stop();
-            }
+        if (!audioExecutor.isShutdown()) {
+            audioExecutor.execute(() -> {
+                synchronized (audioLock) {
+                    stopAudioNow();
+                }
+            });
+        }
+    }
+
+    private void stopAudioNow() {
+        audioGeneration++;
+        if (audioStopTask != null) {
+            audioStopTask.cancel(false);
+            audioStopTask = null;
+        }
+        releaseBeepAudio();
+        if (silentAudio != null
+                && silentAudio.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+            silentAudio.stop();
         }
     }
 
