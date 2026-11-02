@@ -6,7 +6,6 @@ import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
-import android.media.ToneGenerator;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -58,15 +57,14 @@ public class MainActivity extends Activity {
     private LinearLayout pauseControls;
     private boolean paused;
     private volatile boolean destroyed;
-    private ToneGenerator toneGenerator;
     private AudioTrack silentAudio;
+    private AudioTrack beepAudio;
     private ScheduledFuture<?> audioStopTask;
     private int audioGeneration;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        toneGenerator = new ToneGenerator(AudioManager.STREAM_MUSIC, 100);
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         loadWorkouts();
         showWorkoutList();
@@ -85,10 +83,6 @@ public class MainActivity extends Activity {
             if (silentAudio != null) {
                 silentAudio.release();
                 silentAudio = null;
-            }
-            if (toneGenerator != null) {
-                toneGenerator.release();
-                toneGenerator = null;
             }
         }
         super.onDestroy();
@@ -460,21 +454,63 @@ public class MainActivity extends Activity {
 
     private void playBeep(boolean endOfInterval, boolean keepAudioWarm) {
         synchronized (audioLock) {
-            if (toneGenerator != null) {
-                toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP,
-                        endOfInterval ? FINAL_BEEP_DURATION_MS : BEEP_DURATION_MS);
-                if (endOfInterval && !keepAudioWarm) {
-                    int generation = audioGeneration;
-                    audioStopTask = timerExecutor.schedule(() -> {
-                        synchronized (audioLock) {
-                            if (generation == audioGeneration) {
-                                audioStopTask = null;
-                                stopAudio();
-                            }
-                        }
-                    }, 500, TimeUnit.MILLISECONDS);
-                }
+            releaseBeepAudio();
+            int durationMs = endOfInterval ? FINAL_BEEP_DURATION_MS : BEEP_DURATION_MS;
+            int sampleRate = 16000;
+            short[] samples = createBeepSamples(durationMs, sampleRate);
+            beepAudio = new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setLegacyStreamType(AudioManager.STREAM_MUSIC)
+                            .build())
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build())
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .setBufferSizeInBytes(samples.length * 2)
+                    .build();
+            if (beepAudio.getState() != AudioTrack.STATE_INITIALIZED
+                    || beepAudio.write(samples, 0, samples.length) != samples.length) {
+                releaseBeepAudio();
+                throw new IllegalStateException("Could not initialize timer beep audio");
             }
+            beepAudio.play();
+            if (endOfInterval && !keepAudioWarm) {
+                int generation = audioGeneration;
+                audioStopTask = timerExecutor.schedule(() -> {
+                    synchronized (audioLock) {
+                        if (generation == audioGeneration) {
+                            audioStopTask = null;
+                            stopAudio();
+                        }
+                    }
+                }, durationMs + 100L, TimeUnit.MILLISECONDS);
+            }
+        }
+    }
+
+    private short[] createBeepSamples(int durationMs, int sampleRate) {
+        int sampleCount = durationMs * sampleRate / 1000;
+        int fadeSamples = sampleRate / 200;
+        short[] samples = new short[sampleCount];
+        for (int i = 0; i < sampleCount; i++) {
+            double envelope = Math.min(1.0, Math.min(
+                    (double) i / fadeSamples,
+                    (double) (sampleCount - 1 - i) / fadeSamples));
+            samples[i] = (short) (Short.MAX_VALUE * 0.6 * envelope
+                    * Math.sin(2.0 * Math.PI * 1000 * i / sampleRate));
+        }
+        return samples;
+    }
+
+    private void releaseBeepAudio() {
+        if (beepAudio != null) {
+            if (beepAudio.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+                beepAudio.stop();
+            }
+            beepAudio.release();
+            beepAudio = null;
         }
     }
 
@@ -485,9 +521,7 @@ public class MainActivity extends Activity {
                 audioStopTask.cancel(false);
                 audioStopTask = null;
             }
-            if (toneGenerator != null) {
-                toneGenerator.stopTone();
-            }
+            releaseBeepAudio();
             if (silentAudio != null
                     && silentAudio.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
                 silentAudio.stop();
