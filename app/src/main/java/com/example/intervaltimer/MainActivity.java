@@ -6,6 +6,7 @@ import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.media.ToneGenerator;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -59,6 +60,7 @@ public class MainActivity extends Activity {
     private LinearLayout pauseControls;
     private boolean paused;
     private volatile boolean destroyed;
+    private ToneGenerator toneGenerator;
     private AudioTrack silentAudio;
     private AudioTrack beepAudio;
     private ScheduledFuture<?> audioStopTask;
@@ -67,7 +69,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setVolumeControlStream(AudioManager.STREAM_MUSIC);
+        toneGenerator = new ToneGenerator(AudioManager.STREAM_ALARM, 100);
+        setVolumeControlStream(AudioManager.STREAM_ALARM);
         loadWorkouts();
         showWorkoutList();
     }
@@ -87,6 +90,10 @@ public class MainActivity extends Activity {
                     if (silentAudio != null) {
                         silentAudio.release();
                         silentAudio = null;
+                    }
+                    if (toneGenerator != null) {
+                        toneGenerator.release();
+                        toneGenerator = null;
                     }
                 }
             });
@@ -474,8 +481,14 @@ public class MainActivity extends Activity {
     }
 
     private void playBeepNow(boolean endOfInterval, boolean keepAudioWarm) {
+        if (toneGenerator != null) {
+            toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, BEEP_DURATION_MS);
+        }
+        if (!endOfInterval) {
+            return;
+        }
         releaseBeepAudio();
-        int durationMs = endOfInterval ? FINAL_BEEP_DURATION_MS : BEEP_DURATION_MS;
+        int durationMs = FINAL_BEEP_DURATION_MS;
         int sampleRate = 16000;
         short[] samples = createBeepSamples(durationMs, sampleRate);
         beepAudio = new AudioTrack.Builder()
