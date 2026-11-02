@@ -234,6 +234,7 @@ public class MainActivity extends Activity {
         pauseControls.addView(resume);
         pauseControls.addView(forward);
         pauseControls.addView(end);
+        pauseControls.setVisibility(View.GONE);
 
         root.addView(phaseLabel);
         root.addView(countdown);
@@ -265,8 +266,9 @@ public class MainActivity extends Activity {
             return;
         }
         int seconds = timer.secondsRemaining();
-        countdown.setText(String.format(Locale.getDefault(), "%d:%02d", seconds / 60, seconds % 60));
-        countdown.setTextSize(seconds >= 3600 ? 72 : 96);
+        String time = Workout.formatDuration(seconds);
+        countdown.setText(time);
+        countdown.setTextSize(time.length() <= 5 ? 96 : time.length() <= 7 ? 72 : 48);
         periodsLeft.setText("Work periods left: " + timer.workPeriodsLeft());
         switch (timer.phase()) {
             case PREPARATION:
@@ -283,7 +285,7 @@ public class MainActivity extends Activity {
                 break;
             case FINISHED:
                 phaseLabel.setText("Workout complete");
-                countdown.setText("0:00");
+                countdown.setText("00:00");
                 root.setBackgroundColor(RED);
                 pauseControls.setVisibility(View.VISIBLE);
                 break;

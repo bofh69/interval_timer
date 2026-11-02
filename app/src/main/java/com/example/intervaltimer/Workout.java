@@ -29,6 +29,8 @@ public final class Workout {
     }
 
     public static String formatDuration(int seconds) {
-        return String.format(Locale.getDefault(), "%d:%02d", seconds / 60, seconds % 60);
+        int minutes = seconds / 60;
+        return String.format(Locale.getDefault(), "%s:%02d",
+                minutes == 0 ? "00" : Integer.toString(minutes), seconds % 60);
     }
 }

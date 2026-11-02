@@ -44,6 +44,6 @@ public class WorkoutTimerTest {
     public void unnamedWorkoutUsesConfiguredValues() {
         Workout workout = new Workout(" ", 8, 10, 120, 10);
 
-        assertEquals("10 x 0:10 work, 2:00 rest", workout.displayName());
+        assertEquals("10 x 00:10 work, 2:00 rest", workout.displayName());
     }
 }
