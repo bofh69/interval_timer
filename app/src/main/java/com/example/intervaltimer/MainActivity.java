@@ -2,7 +2,10 @@ package com.example.intervaltimer;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioTrack;
 import android.media.ToneGenerator;
 import android.os.Build;
 import android.os.Bundle;
@@ -35,11 +38,15 @@ public class MainActivity extends Activity {
     private static final int GREEN = 0xFF2E7D32;
     private static final int RED = 0xFFC62828;
     private static final int BLUE = 0xFF1565C0;
+    private static final int BEEP_DURATION_MS = 100;
+    private static final int FINAL_BEEP_DURATION_MS = 750;
     private final ArrayList<Workout> workouts = new ArrayList<>();
     private final Object timerLock = new Object();
     private final Object audioLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ScheduledExecutorService timerExecutor =
+            Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService audioExecutor =
             Executors.newSingleThreadScheduledExecutor();
     private ScheduledFuture<?> timerTask;
     private final Runnable timerTick = this::runTimerTick;
@@ -54,25 +61,42 @@ public class MainActivity extends Activity {
     private boolean paused;
     private volatile boolean destroyed;
     private ToneGenerator toneGenerator;
+    private AudioTrack silentAudio;
+    private ScheduledFuture<?> audioStopTask;
+    private int audioGeneration;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         toneGenerator = new ToneGenerator(AudioManager.STREAM_ALARM, 100);
+        setVolumeControlStream(AudioManager.STREAM_ALARM);
         loadWorkouts();
         showWorkoutList();
     }
 
     @Override
     protected void onDestroy() {
-        destroyed = true;
-        timerExecutor.shutdownNow();
+        synchronized (timerLock) {
+            destroyed = true;
+            timer = null;
+            timerExecutor.shutdownNow();
+        }
         mainHandler.removeCallbacksAndMessages(null);
-        synchronized (audioLock) {
-            if (toneGenerator != null) {
-                toneGenerator.release();
-                toneGenerator = null;
-            }
+        if (!audioExecutor.isShutdown()) {
+            audioExecutor.execute(() -> {
+                synchronized (audioLock) {
+                    stopAudioNow();
+                    if (silentAudio != null) {
+                        silentAudio.release();
+                        silentAudio = null;
+                    }
+                    if (toneGenerator != null) {
+                        toneGenerator.release();
+                        toneGenerator = null;
+                    }
+                }
+            });
+            audioExecutor.shutdown();
         }
         super.onDestroy();
     }
@@ -208,6 +232,8 @@ public class MainActivity extends Activity {
         root.setOnClickListener(v -> setPaused(!paused));
         countdown = text("", 96, 0xFFFFFFFF);
         countdown.setGravity(Gravity.CENTER);
+        countdown.setSingleLine(true);
+        countdown.setHorizontallyScrolling(false);
         phaseLabel = text("", 24, 0xFFFFFFFF);
         phaseLabel.setGravity(Gravity.CENTER);
         periodsLeft = text("", 22, 0xFFFFFFFF);
@@ -344,9 +370,13 @@ public class MainActivity extends Activity {
                 timerTask.cancel(false);
                 timerTask = null;
             }
-        }
-        if (shouldBeep) {
-            playBeep(endOfInterval);
+            boolean keepAudioWarm = !finished && timer.secondsRemaining() <= 4;
+            if (keepAudioWarm) {
+                prepareAudio();
+            }
+            if (shouldBeep) {
+                playBeep(endOfInterval, keepAudioWarm);
+            }
         }
         mainHandler.post(() -> {
             if (destroyed) {
@@ -364,6 +394,10 @@ public class MainActivity extends Activity {
             if (timerTask != null) {
                 timerTask.cancel(false);
             }
+            if (timer != null && timer.phase() != WorkoutTimer.Phase.FINISHED
+                    && timer.secondsRemaining() <= 4) {
+                prepareAudio();
+            }
             timerTask = timerExecutor.scheduleAtFixedRate(timerTick, 1, 1, TimeUnit.SECONDS);
         }
     }
@@ -374,6 +408,7 @@ public class MainActivity extends Activity {
                 timerTask.cancel(false);
                 timerTask = null;
             }
+            stopAudio();
         }
     }
 
@@ -386,21 +421,105 @@ public class MainActivity extends Activity {
         android.graphics.Paint.FontMetrics metrics = countdown.getPaint().getFontMetrics();
         float textHeight = metrics.bottom - metrics.top;
         float availableWidth = countdown.getWidth() - countdown.getPaddingLeft()
-                - countdown.getPaddingRight();
+                - countdown.getPaddingRight() - 2;
         float availableHeight = countdown.getHeight() - countdown.getPaddingTop()
-                - countdown.getPaddingBottom();
-        if (textWidth > 0 && textHeight > 0) {
-            float fittingSize = Math.min(currentSize * availableWidth / textWidth,
-                    currentSize * availableHeight / textHeight);
+                - countdown.getPaddingBottom() - 2;
+        if (textWidth > 0 && textHeight > 0 && availableWidth > 0 && availableHeight > 0) {
+            float fittingSize = (float) Math.floor(Math.min(
+                    currentSize * availableWidth / textWidth,
+                    currentSize * availableHeight / textHeight));
             countdown.setTextSize(TypedValue.COMPLEX_UNIT_PX, fittingSize);
         }
     }
 
-    private void playBeep(boolean endOfInterval) {
-        synchronized (audioLock) {
-            if (toneGenerator != null) {
-                toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, endOfInterval ? 500 : 100);
+    private void prepareAudio() {
+        audioExecutor.execute(() -> {
+            synchronized (audioLock) {
+                prepareAudioNow();
             }
+        });
+    }
+
+    private void prepareAudioNow() {
+        audioGeneration++;
+        if (audioStopTask != null) {
+            audioStopTask.cancel(false);
+            audioStopTask = null;
+        }
+        if (silentAudio == null) {
+            int sampleRate = 8000;
+            short[] silence = new short[sampleRate];
+            silentAudio = new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setLegacyStreamType(AudioManager.STREAM_ALARM)
+                            .build())
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build())
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .setBufferSizeInBytes(silence.length * 2)
+                    .build();
+            if (silentAudio.write(silence, 0, silence.length) != silence.length
+                    || silentAudio.setLoopPoints(0, silence.length, -1) != AudioTrack.SUCCESS) {
+                throw new IllegalStateException("Could not initialize headset warm-up audio");
+            }
+        }
+        if (silentAudio.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
+            silentAudio.play();
+        }
+    }
+
+    private void playBeep(boolean endOfInterval, boolean keepAudioWarm) {
+        audioExecutor.execute(() -> {
+            synchronized (audioLock) {
+                playBeepNow(endOfInterval, keepAudioWarm);
+            }
+        });
+    }
+
+    private void playBeepNow(boolean endOfInterval, boolean keepAudioWarm) {
+        if (toneGenerator != null) {
+            toneGenerator.startTone(endOfInterval
+                            ? ToneGenerator.TONE_PROP_NACK : ToneGenerator.TONE_PROP_BEEP,
+                    endOfInterval ? FINAL_BEEP_DURATION_MS : BEEP_DURATION_MS);
+        }
+        if (endOfInterval && !keepAudioWarm) {
+            int generation = audioGeneration;
+            audioStopTask = audioExecutor.schedule(() -> {
+                synchronized (audioLock) {
+                    if (generation == audioGeneration) {
+                        audioStopTask = null;
+                        stopAudioNow();
+                    }
+                }
+            }, FINAL_BEEP_DURATION_MS + 100L, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void stopAudio() {
+        if (!audioExecutor.isShutdown()) {
+            audioExecutor.execute(() -> {
+                synchronized (audioLock) {
+                    stopAudioNow();
+                }
+            });
+        }
+    }
+
+    private void stopAudioNow() {
+        audioGeneration++;
+        if (audioStopTask != null) {
+            audioStopTask.cancel(false);
+            audioStopTask = null;
+        }
+        if (toneGenerator != null) {
+            toneGenerator.stopTone();
+        }
+        if (silentAudio != null
+                && silentAudio.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+            silentAudio.stop();
         }
     }
 

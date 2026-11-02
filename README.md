@@ -13,3 +13,7 @@ Install JDK 17 and the Android SDK, then run:
 The installable debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 GitHub Actions runs the unit tests and build on pushes and pull requests, and
 attaches the APK to a GitHub release for any pushed tag.
+
+## License
+
+Licensed under the GNU General Public License, version 3. See [LICENSE](LICENSE).
