@@ -7,7 +7,9 @@ import android.media.ToneGenerator;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
@@ -24,32 +26,23 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
     private static final int GREEN = 0xFF2E7D32;
     private static final int RED = 0xFFC62828;
     private static final int BLUE = 0xFF1565C0;
     private final ArrayList<Workout> workouts = new ArrayList<>();
-    private final Handler handler = new Handler();
-    private final Runnable timerTick = new Runnable() {
-        @Override
-        public void run() {
-            if (timer == null || paused) {
-                return;
-            }
-            int before = timer.secondsRemaining();
-            timer.tick();
-            if (before <= 3 && before > 0) {
-                playBeep(before == 1);
-            }
-            updateTimerDisplay();
-            if (timer.phase() != WorkoutTimer.Phase.FINISHED) {
-                handler.postDelayed(this, 1000);
-            } else {
-                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-            }
-        }
-    };
+    private final Object timerLock = new Object();
+    private final Object audioLock = new Object();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ScheduledExecutorService timerExecutor =
+            Executors.newSingleThreadScheduledExecutor();
+    private ScheduledFuture<?> timerTask;
+    private final Runnable timerTick = this::runTimerTick;
 
     private LinearLayout root;
     private WorkoutTimer timer;
@@ -59,6 +52,7 @@ public class MainActivity extends Activity {
     private TextView periodsLeft;
     private LinearLayout pauseControls;
     private boolean paused;
+    private volatile boolean destroyed;
     private ToneGenerator toneGenerator;
 
     @Override
@@ -71,9 +65,14 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        handler.removeCallbacks(timerTick);
-        if (toneGenerator != null) {
-            toneGenerator.release();
+        destroyed = true;
+        timerExecutor.shutdownNow();
+        mainHandler.removeCallbacksAndMessages(null);
+        synchronized (audioLock) {
+            if (toneGenerator != null) {
+                toneGenerator.release();
+                toneGenerator = null;
+            }
         }
         super.onDestroy();
     }
@@ -87,7 +86,10 @@ public class MainActivity extends Activity {
     }
 
     private void showWorkoutList() {
-        timer = null;
+        cancelTimerTask();
+        synchronized (timerLock) {
+            timer = null;
+        }
         paused = false;
         root = createRoot();
         TextView title = text("Workouts", 28, 0xFF222222);
@@ -150,11 +152,11 @@ public class MainActivity extends Activity {
         LinearLayout fields = new LinearLayout(this);
         fields.setPadding(16, 0, 16, 0);
         fields.setOrientation(LinearLayout.VERTICAL);
-        fields.addView(name);
-        fields.addView(preparation);
-        fields.addView(work);
-        fields.addView(rest);
-        fields.addView(repeats);
+        addLabeledField(fields, "Name", name);
+        addLabeledField(fields, "Time before start (seconds)", preparation);
+        addLabeledField(fields, "Working time (seconds)", work);
+        addLabeledField(fields, "Resting time (seconds)", rest);
+        addLabeledField(fields, "Repeats", repeats);
         scroll.addView(fields);
         root.addView(scroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
@@ -190,18 +192,20 @@ public class MainActivity extends Activity {
     }
 
     private void startWorkout(Workout workout) {
-        activeWorkout = workout;
-        timer = new WorkoutTimer(workout);
-        paused = false;
+        synchronized (timerLock) {
+            activeWorkout = workout;
+            timer = new WorkoutTimer(workout);
+            paused = false;
+        }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         showTimer();
-        handler.removeCallbacks(timerTick);
-        handler.postDelayed(timerTick, 1000);
+        scheduleTimerTask();
     }
 
     private void showTimer() {
         root = createRoot();
         root.setGravity(Gravity.CENTER);
+        root.setOnClickListener(v -> setPaused(!paused));
         countdown = text("", 96, 0xFFFFFFFF);
         countdown.setGravity(Gravity.CENTER);
         phaseLabel = text("", 24, 0xFFFFFFFF);
@@ -213,19 +217,23 @@ public class MainActivity extends Activity {
 
         Button back = button("◀");
         back.setOnClickListener(v -> {
-            if (timer != null) {
-                timer.skipBack();
-                updateTimerDisplay();
+            synchronized (timerLock) {
+                if (timer != null) {
+                    timer.skipBack();
+                }
             }
+            updateTimerDisplay();
         });
         Button resume = button("▶");
         resume.setOnClickListener(v -> setPaused(false));
         Button forward = button("▶|");
         forward.setOnClickListener(v -> {
-            if (timer != null) {
-                timer.skipForward();
-                updateTimerDisplay();
+            synchronized (timerLock) {
+                if (timer != null) {
+                    timer.skipForward();
+                }
             }
+            updateTimerDisplay();
         });
         Button end = button("End");
         end.setOnClickListener(v -> {
@@ -239,9 +247,13 @@ public class MainActivity extends Activity {
         pauseControls.setVisibility(View.GONE);
 
         root.addView(phaseLabel);
-        root.addView(countdown);
+        root.addView(countdown, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
         root.addView(periodsLeft);
         root.addView(pauseControls);
+        countdown.addOnLayoutChangeListener((view, left, top, right, bottom,
+                                             oldLeft, oldTop, oldRight, oldBottom) ->
+                adjustCountdownTextSize());
         countdown.setOnClickListener(v -> setPaused(!paused));
         phaseLabel.setOnClickListener(v -> setPaused(!paused));
         periodsLeft.setOnClickListener(v -> setPaused(!paused));
@@ -250,29 +262,37 @@ public class MainActivity extends Activity {
     }
 
     private void setPaused(boolean pause) {
-        if (timer == null || timer.phase() == WorkoutTimer.Phase.FINISHED) {
-            return;
+        synchronized (timerLock) {
+            if (timer == null || timer.phase() == WorkoutTimer.Phase.FINISHED) {
+                return;
+            }
+            paused = pause;
         }
-        paused = pause;
         pauseControls.setVisibility(paused ? View.VISIBLE : View.GONE);
         if (paused) {
-            handler.removeCallbacks(timerTick);
+            cancelTimerTask();
         } else {
-            handler.removeCallbacks(timerTick);
-            handler.postDelayed(timerTick, 1000);
+            scheduleTimerTask();
         }
     }
 
     private void updateTimerDisplay() {
-        if (timer == null || countdown == null) {
-            return;
+        WorkoutTimer.Phase phase;
+        int seconds;
+        int periodsRemaining;
+        synchronized (timerLock) {
+            if (timer == null || countdown == null) {
+                return;
+            }
+            phase = timer.phase();
+            seconds = timer.secondsRemaining();
+            periodsRemaining = timer.workPeriodsLeft();
         }
-        int seconds = timer.secondsRemaining();
         String time = Workout.formatDuration(seconds);
         countdown.setText(time);
-        countdown.setTextSize(time.length() <= 5 ? 96 : time.length() <= 7 ? 72 : 48);
-        periodsLeft.setText("Work periods left: " + timer.workPeriodsLeft());
-        switch (timer.phase()) {
+        adjustCountdownTextSize();
+        periodsLeft.setText("Work periods left: " + periodsRemaining);
+        switch (phase) {
             case PREPARATION:
                 phaseLabel.setText("Get ready");
                 root.setBackgroundColor(RED);
@@ -295,16 +315,92 @@ public class MainActivity extends Activity {
     }
 
     private void stopTimer() {
-        handler.removeCallbacks(timerTick);
-        paused = true;
-        timer = null;
+        cancelTimerTask();
+        synchronized (timerLock) {
+            paused = true;
+            timer = null;
+        }
         countdown = null;
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
+    private void runTimerTick() {
+        if (destroyed) {
+            return;
+        }
+        boolean shouldBeep;
+        boolean endOfInterval;
+        boolean finished;
+        synchronized (timerLock) {
+            if (timer == null || paused) {
+                return;
+            }
+            int before = timer.secondsRemaining();
+            timer.tick();
+            shouldBeep = before <= 3 && before > 0;
+            endOfInterval = before == 1;
+            finished = timer.phase() == WorkoutTimer.Phase.FINISHED;
+            if (finished && timerTask != null) {
+                timerTask.cancel(false);
+                timerTask = null;
+            }
+        }
+        if (shouldBeep) {
+            playBeep(endOfInterval);
+        }
+        mainHandler.post(() -> {
+            if (destroyed) {
+                return;
+            }
+            updateTimerDisplay();
+            if (finished) {
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
+        });
+    }
+
+    private void scheduleTimerTask() {
+        synchronized (timerLock) {
+            if (timerTask != null) {
+                timerTask.cancel(false);
+            }
+            timerTask = timerExecutor.scheduleAtFixedRate(timerTick, 1, 1, TimeUnit.SECONDS);
+        }
+    }
+
+    private void cancelTimerTask() {
+        synchronized (timerLock) {
+            if (timerTask != null) {
+                timerTask.cancel(false);
+                timerTask = null;
+            }
+        }
+    }
+
+    private void adjustCountdownTextSize() {
+        if (countdown == null || countdown.getWidth() == 0 || countdown.getHeight() == 0) {
+            return;
+        }
+        float currentSize = countdown.getTextSize();
+        float textWidth = countdown.getPaint().measureText(countdown.getText().toString());
+        android.graphics.Paint.FontMetrics metrics = countdown.getPaint().getFontMetrics();
+        float textHeight = metrics.bottom - metrics.top;
+        float availableWidth = countdown.getWidth() - countdown.getPaddingLeft()
+                - countdown.getPaddingRight();
+        float availableHeight = countdown.getHeight() - countdown.getPaddingTop()
+                - countdown.getPaddingBottom();
+        if (textWidth > 0 && textHeight > 0) {
+            float fittingSize = Math.min(currentSize * availableWidth / textWidth,
+                    currentSize * availableHeight / textHeight);
+            countdown.setTextSize(TypedValue.COMPLEX_UNIT_PX, fittingSize);
+        }
+    }
+
     private void playBeep(boolean endOfInterval) {
-        if (toneGenerator != null) {
-            toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, endOfInterval ? 250 : 100);
+        synchronized (audioLock) {
+            if (toneGenerator != null) {
+                toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, endOfInterval ? 500 : 100);
+            }
         }
     }
 
@@ -327,6 +423,14 @@ public class MainActivity extends Activity {
             return insets;
         });
         return layout;
+    }
+
+    private void addLabeledField(LinearLayout container, String labelText, EditText input) {
+        TextView label = text(labelText, 16, 0xFF222222);
+        input.setId(View.generateViewId());
+        label.setLabelFor(input.getId());
+        container.addView(label);
+        container.addView(input);
     }
 
     private TextView text(String value, int size, int color) {
