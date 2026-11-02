@@ -62,7 +62,6 @@ public class MainActivity extends Activity {
     private volatile boolean destroyed;
     private ToneGenerator toneGenerator;
     private AudioTrack silentAudio;
-    private AudioTrack beepAudio;
     private ScheduledFuture<?> audioStopTask;
     private int audioGeneration;
 
@@ -452,7 +451,7 @@ public class MainActivity extends Activity {
             short[] silence = new short[sampleRate];
             silentAudio = new AudioTrack.Builder()
                     .setAudioAttributes(new AudioAttributes.Builder()
-                            .setLegacyStreamType(AudioManager.STREAM_MUSIC)
+                            .setLegacyStreamType(AudioManager.STREAM_ALARM)
                             .build())
                     .setAudioFormat(new AudioFormat.Builder()
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
@@ -482,33 +481,10 @@ public class MainActivity extends Activity {
 
     private void playBeepNow(boolean endOfInterval, boolean keepAudioWarm) {
         if (toneGenerator != null) {
-            toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, BEEP_DURATION_MS);
+            toneGenerator.startTone(endOfInterval
+                            ? ToneGenerator.TONE_PROP_NACK : ToneGenerator.TONE_PROP_BEEP,
+                    endOfInterval ? FINAL_BEEP_DURATION_MS : BEEP_DURATION_MS);
         }
-        if (!endOfInterval) {
-            return;
-        }
-        releaseBeepAudio();
-        int durationMs = FINAL_BEEP_DURATION_MS;
-        int sampleRate = 16000;
-        short[] samples = createBeepSamples(durationMs, sampleRate);
-        beepAudio = new AudioTrack.Builder()
-                .setAudioAttributes(new AudioAttributes.Builder()
-                        .setLegacyStreamType(AudioManager.STREAM_MUSIC)
-                        .build())
-                .setAudioFormat(new AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build())
-                .setTransferMode(AudioTrack.MODE_STATIC)
-                .setBufferSizeInBytes(samples.length * 2)
-                .build();
-        if (beepAudio.getState() != AudioTrack.STATE_INITIALIZED
-                || beepAudio.write(samples, 0, samples.length) != samples.length) {
-            releaseBeepAudio();
-            throw new IllegalStateException("Could not initialize timer beep audio");
-        }
-        beepAudio.play();
         if (endOfInterval && !keepAudioWarm) {
             int generation = audioGeneration;
             audioStopTask = audioExecutor.schedule(() -> {
@@ -518,31 +494,7 @@ public class MainActivity extends Activity {
                         stopAudioNow();
                     }
                 }
-            }, durationMs + 100L, TimeUnit.MILLISECONDS);
-        }
-    }
-
-    private short[] createBeepSamples(int durationMs, int sampleRate) {
-        int sampleCount = durationMs * sampleRate / 1000;
-        int fadeSamples = sampleRate / 200;
-        short[] samples = new short[sampleCount];
-        for (int i = 0; i < sampleCount; i++) {
-            double envelope = Math.min(1.0, Math.min(
-                    (double) i / fadeSamples,
-                    (double) (sampleCount - 1 - i) / fadeSamples));
-            samples[i] = (short) (Short.MAX_VALUE * 0.6 * envelope
-                    * Math.sin(2.0 * Math.PI * 1000 * i / sampleRate));
-        }
-        return samples;
-    }
-
-    private void releaseBeepAudio() {
-        if (beepAudio != null) {
-            if (beepAudio.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
-                beepAudio.stop();
-            }
-            beepAudio.release();
-            beepAudio = null;
+            }, FINAL_BEEP_DURATION_MS + 100L, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -562,7 +514,9 @@ public class MainActivity extends Activity {
             audioStopTask.cancel(false);
             audioStopTask = null;
         }
-        releaseBeepAudio();
+        if (toneGenerator != null) {
+            toneGenerator.stopTone();
+        }
         if (silentAudio != null
                 && silentAudio.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
             silentAudio.stop();
